@@ -1,0 +1,19 @@
+# Resource Assignment Problem (RAP)
+RAP:
+  R: ['Carlos', 'Joe', 'Monika']
+  J: ['Tester', 'JavaDeveloper', 'Architect']
+  combinations:
+    - ['Carlos', 'Tester']
+    - ['Carlos', 'JavaDeveloper']
+    - ['Carlos', 'Architect']
+    - ['Joe', 'Tester']
+    - ['Joe', 'JavaDeveloper']
+    - ['Joe', 'Architect']
+    - ['Monika', 'Tester']
+    - ['Monika', 'JavaDeveloper']
+    - ['Monika', 'Architect']
+
+  scores: [53, 27, 13, 80, 47, 67, 53, 73, 47]
+  costs: [1, 1, 1, 2, 2, 2, 3, 3, 3]
+
+
