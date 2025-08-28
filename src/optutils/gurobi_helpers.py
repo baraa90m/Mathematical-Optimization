@@ -16,26 +16,27 @@ def delta(t, q):
     return (1/(1 + q) ** t)
 
 
-def define_variables_NF(
+def define_variables(
         model,
         blocks: Iterable[Hashable],
         periods: Iterable[Hashable],
         plants: Iterable[Hashable] = (),
         stockpiles: Iterable[Hashable] = (),
-        x_binary: bool = True
+        waste_dumps: Iterable[Hashable] = (),
+        x_binary: bool = True,
+        aggregate = False
 ):
     """
     Create decision variables for the Natural Formulation (NF) with stockpiles.
 
     Args:
         model: Gurobi model.
-        blocks: Block IDs.
-        periods: Period IDs.
-        plants: Plant IDs.
-        stockpiles: Stockpile IDs.
+        blocks, periods, plants, stockpiles, waste_dumps: index sets.
+        x_binary: if False, x is continuous in [0,1] (useful for LP relaxations).
+        aggregate: if True, create AT-specific variables.
 
 
-    Variables:
+    Base variables (always created):
         x[i,t]   (binary)    — 1 if block i is mined by end of period t (cumulative).
         y[i,t]   ∈ [0,1]     — fraction of block i processed in period t.
         z_p[i,t,p] ∈ [0,1]   — fraction of block i sent directly to plant p in period t.
@@ -45,20 +46,32 @@ def define_variables_NF(
         metalSP[p,s,t] ≥ 0   — metal quantity sent from stockpile s to plant p in period t.
         metalS_rem[s,t]≥ 0   — metal quantity remaining in stockpile s during period t.
 
+    AT-specific variables (only when aggregate=True):
+        z_sp[i,t,s,p]     ∈ [0,1]            — fraction of block i routed (via s) to plant p in t.
+        z_ss[i,t,s]       ∈ [0,1]            — fraction of block i remaining in stockpile s in t.
+        f_t[t]            ∈ [0,1]            — out-fraction for period t.
     Notes:
         • z_* variables are fractions per block; ore*/metal* are absolute quantities (e.g., tonnes).
         • Return order matches the tuple below—keep the caller’s unpacking consistent.
 
     Returns:
-        (x, y, z_p, z_s, oreSP, oreS_rem, metalSP, metalS_rem)
+        if aggregate=True  (AT order):
+            (x, y, z_p, z_s, oreSP, oreS_rem, metalSP, metalS_rem, z_ss, z_sp, f_t)
+        else:
+            (x, y, z_p, z_s, oreSP, oreS_rem, metalSP, metalS_rem)
     """
 
     # --- Helper ---
+    global block_periods_stockpiles_plants
     block_periods = tuplelist(product(blocks, periods))
     block_periods_plants = tuplelist(product(blocks, periods, plants))
     block_periods_stockpiles = tuplelist(product(blocks, periods, stockpiles))
     plants_stockpiles_periods = tuplelist(product(plants, stockpiles, periods))
     stockpile_periods = tuplelist(product(stockpiles, periods))
+
+    # Only needed if aggregate=True
+    if aggregate:
+        block_periods_stockpiles_plants = tuplelist(product(blocks, periods, stockpiles, plants))
 
     # Decision variables
     # x[i,t] = 1 if block i is mined by (end of) period t  (cumulative)
@@ -88,12 +101,29 @@ def define_variables_NF(
     # metal remaining in stockpile
     metalS_rem = model.addVars(stockpile_periods, vtype=GRB.CONTINUOUS, lb=0, name="metalS_rem")
 
-    return x, y, z_p, z_s, oreSP, oreS_rem, metalSP, metalS_rem
+    # --- New AT-specific variables ---
+    z_sp = z_ss = f_t = None
+    if aggregate:
+        # z[i,t,s,p] ∈ [0,1], fraction of block i sent from the stockpile s for processing in the plant p during time period t
+        z_sp = model.addVars(block_periods_stockpiles_plants, vtype=GRB.CONTINUOUS, lb=0, ub=1, name="z_sp")
 
-def define_objective_NF(
+        # z[i,t,s] ∈ [0,1], fraction of block i remaining in the stockpile s in time period t
+        z_ss = model.addVars(block_periods_stockpiles, vtype=GRB.CONTINUOUS, lb=0, ub=1, name="z_ss")
+
+        # f_t ∈ [0,1], out-fractions variable for each time period t
+        f_t = model.addVars(periods, vtype=GRB.CONTINUOUS, lb=0, ub=1, name="f_t")
+
+    if aggregate:
+        return (
+            x, y, z_p, z_s, oreSP, oreS_rem, metalSP, metalS_rem, z_ss, z_sp, f_t
+        )
+    else:
+        return x, y, z_p, z_s, oreSP, oreS_rem, metalSP, metalS_rem
+
+def define_objective(
         model: gp.Model,
         y, z_p, oreSP, metalSP,
-        blocks, plants, stockpiles, time_periods,
+        blocks, plants, stockpiles, periods,
         O, A, R,                 # dict-like: block -> ore, metal, rock
         c: float,                # revenue per metal unit
         proc_cost: float,        # processing cost per ore unit
@@ -147,20 +177,23 @@ def define_objective_NF(
             - proc_cost * (oP(t) + dir_ore(t))
             - m * mined_rock(t)
         )
-        for t in time_periods
+        for t in periods
     )
 
     model.setObjective(obj, GRB.MAXIMIZE)
 
 
-def define_constraints_NF(
+def define_constraints(
     model, x, y, z_p, z_s, oreS_rem, metalS_rem, oreSP, metalSP,
     blocks, plants, stockpiles, time_periods,
     O, A, R,                  # dict-like by block: ore, metal, rock
     P,                        # precedence: dict i -> iterable of predecessors j
     mining_capacity,          # dict-like by t
     processing_capacity,      # dict-like by t
-    enforce_mixing=False      # True => add (11), False => skip
+    enforce_mixing=False,     # True => add (11), False => skip
+    aggregate=False,
+    enforce_mixing_aggregate=False,
+    z_ss=None, z_sp=None, f_t=None,
 ):
     """
     Add Natural Formulation (NF) constraints to the model.
@@ -209,6 +242,11 @@ def define_constraints_NF(
     # --- Helper---
     t0 = min(time_periods)
     tT = max(time_periods)
+
+    # The variables (z_sp, z_ss, f_t) are mandatory in the AT case
+    if aggregate and (z_sp is None or z_ss is None or f_t is None):
+        raise ValueError("aggregate=True requires z_sp, z_ss, and f_t to be provided.")
+
 
     # 1) cumulative completion
     model.addConstrs(
@@ -289,3 +327,59 @@ def define_constraints_NF(
             aS_t = quicksum(metalS_rem[s, t] for s in stockpiles)
             model.addQConstr(aP_t * (oS_t + oP_t) == oP_t * (aS_t + aP_t),
                              name=f"mix_ratio_allS[{t}]")
+
+
+    # --- New AT-specific constraints ---
+    if aggregate:
+
+        assert z_sp is not None and z_ss is not None and f_t is not None
+        # (12) stockpile balance for all i, s, t>=2: z_ss[i,t-1,s] + z_s[i,t-1,s] = z_ss[i,t,s] + z_sp[i,t,s,p]
+        model.addConstrs(
+            (z_ss[i, t - 1, s] + z_s[i, t - 1, s] == z_ss[i, t, s] + quicksum(z_sp[i, t, s, p] for p in plants)
+             for i in blocks for s in stockpiles for t in time_periods[1:]), name="stockpile_balance"
+
+        )
+
+        # (13) stockpile initializing:
+        for i in blocks:
+            for s in stockpiles:
+                model.addConstr(z_ss[i, t0, s] == 0, name=f"zss_start[{i},{s}]")
+                model.addConstr(z_ss[i, tT, s] == 0, name=f"zss_end[{i},{s}]")
+                model.addConstr(quicksum(z_sp[i, t0, s, p] for p in plants) == 0, name=f"zsp_start[{i},{s}]")
+
+        # (14)  ore remaining in stockpile s during period t:
+        #       oreS_rem[s,t] = sum_i O[i] * z_ss[i,t,s]
+        model.addConstrs(
+            (oreS_rem[s, t] == quicksum(O[i] * z_ss[i, t, s] for i in blocks) for s in stockpiles for t in
+             time_periods),
+            name="oreS_rem_def")
+
+        # (15)  ore sent from stockpile s to plant p during period t:
+        #       oreSP[p,s,t] = sum_i O[i] * z_sp[i,t,s,p]
+        model.addConstrs(
+            (quicksum(oreSP[p, s, t] for p in plants) == quicksum(
+                O[i] * quicksum(z_sp[i, t, s, p] for p in plants) for i in blocks)
+             for s in stockpiles for t in time_periods),
+            name="oreSP_def")
+        # (16) metal remaining in stockpile s during period t:
+        #      metalS_rem[] = sum_i A[i] * z_ss[i,t,s]
+        model.addConstrs(
+            (metalS_rem[s, t] == quicksum(A[i] * z_ss[i, t, s] for i in blocks) for s in stockpiles for t in
+             time_periods),
+            name="metalS_rem_def")
+
+        # (17) metal sent from stockpile s to plant p during period t:
+        #      metalSP[s,t] = sum_i A[i] * z_sp[i,t,s]
+        model.addConstrs(
+            (quicksum(metalSP[p, s, t] for p in plants) == quicksum(
+                A[i] * quicksum(z_sp[i, t, s, p] for p in plants) for i in blocks)
+             for s in stockpiles for t in time_periods),
+            name="metalSP_def")
+        if enforce_mixing_aggregate:
+            # (18) Mixing per aggregate i, period t, stockpile s:
+            #      (sum_p z_sp[i,t,s,p]) * (1 - f_t[t]) == z_ss[i,t,s] * f_t[t]
+            model.addConstrs(
+                (quicksum(z_sp[i, t, s, p] for p in plants) * (1 - f_t[t])
+                 == z_ss[i, t, s] * f_t[t] for i in blocks for t in time_periods for s in stockpiles),
+                name="f_t_def"
+            )
