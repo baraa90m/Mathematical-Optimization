@@ -375,6 +375,7 @@ def define_constraints(
                 A[i] * quicksum(z_sp[i, t, s, p] for p in plants) for i in blocks)
              for s in stockpiles for t in time_periods),
             name="metalSP_def")
+
         if enforce_mixing_aggregate:
             # (18) Mixing per aggregate i, period t, stockpile s:
             #      (sum_p z_sp[i,t,s,p]) * (1 - f_t[t]) == z_ss[i,t,s] * f_t[t]
